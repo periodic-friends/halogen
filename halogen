@@ -1,0 +1,172 @@
+#!/bin/bash
+
+. halogen.conf
+. scripts/ghes-export
+
+SOURCE_REPOS=$1
+
+if [ -z ${SOURCE_REPOS} ]; then
+  echo 'please identify the name of org/repo'
+  echo 'e.g.) sh halogen org/repo,org/repo'
+  exit 1
+fi
+
+LOG_DIR='/tmp'
+OUTPUT_FILE="${LOG_DIR}/halogen.log"
+ERROR_FILE="${LOG_DIR}/halogen_error.log"
+CONFLICTS_LOG="${LOG_DIR}/ghe-migrator-conflicts.log"
+IMPORT_LOG="${LOG_DIR}/ghe-migrator-import.log"
+AUDIT_LOG="${LOG_DIR}/audit.log"
+
+output_to_file() {
+  echo "$(date +"%Y-%m-%d %H:%M:%S") $1" | tee -a ${OUTPUT_FILE}
+}
+
+check_config_required_param() {
+  if [ -z "${2}" ]; then
+    echo "${1} is empty. Please see config file."
+    exit 1
+  fi
+}
+
+check_param() {
+  if [ -z "${2}" ]; then
+    echo "$(date +"%Y-%m-%d %H:%M:%S") Failed to get ${1}. Please see ${ERROR_FILE} file."
+    exit 1
+  fi
+}
+
+check_config_required_param 'SOURCE_HOST' ${SOURCE_HOST}
+check_config_required_param 'SOURCE_USER' ${SOURCE_USER}
+check_config_required_param 'SOURCE_TOKEN' ${SOURCE_TOKEN}
+check_config_required_param 'SOURCE_REPOS' ${SOURCE_REPOS}
+check_config_required_param 'TARGET_HOST' ${TARGET_HOST}
+check_config_required_param 'TARGET_USER' ${TARGET_USER}
+check_config_required_param 'TARGET_TOKEN' ${TARGET_TOKEN}
+
+if [ -z ${CONFLICTS_RETRY_COUNT} ];then
+  CONFLICTS_RETRY_COUNT=2
+fi
+
+execute_to_source_instance(){
+  ssh -n -p122 admin@${SOURCE_HOST} -- "${1}" 2> ${ERROR_FILE}
+}
+
+execute_to_target_instance(){
+   ssh -n -p122 admin@${TARGET_HOST} -- "${1}" 2> ${ERROR_FILE}
+}
+
+output_to_file
+output_to_file "Start migration!"
+
+SOURCE_HOSTNAME=$(execute_to_source_instance 'ghe-config core.github-hostname')
+check_param 'SOURCE_HOSTNAME' ${SOURCE_HOSTNAME}
+
+SOURCE_BASE_URL="http://${SOURCE_HOSTNAME}"
+SSL_ENABLED=$(execute_to_source_instance 'ghe-config github-ssl.enabled')
+if [ "$SSL_ENABLED" = "true" ]; then
+  SOURCE_BASE_URL="https://${SOURCE_HOSTNAME}"
+fi
+
+TARGET_HOSTNAME=$(execute_to_target_instance 'ghe-config core.github-hostname')
+check_param 'TARGET_HOSTNAME' ${TARGET_HOSTNAME}
+
+TARGET_BASE_URL="http://${TARGET_HOSTNAME}"
+SSL_ENABLED=$(execute_to_target_instance 'ghe-config github-ssl.enabled')
+if [ "$SSL_ENABLED" = "true" ]; then
+  TARGET_BASE_URL="https://${TARGET_HOSTNAME}"
+fi
+
+SOURCE_VERSION=$(curl -k -s ${SOURCE_BASE_URL}/api/v3/meta | jq -r '.installed_version' 2> ${ERROR_FILE})
+TARGET_VERSION=$(curl -k -s ${TARGET_BASE_URL}/api/v3/meta | jq -r '.installed_version' 2> ${ERROR_FILE})
+check_param 'SOURCE_VERSION' ${SOURCE_VERSION}
+check_param 'TARGET_VERSION' ${TARGET_VERSION}
+
+output_to_file "SOURCE HOST: ${SOURCE_BASE_URL} (${SOURCE_VERSION})" 
+output_to_file "TARGET HOST: ${TARGET_BASE_URL} (${TARGET_VERSION})"
+
+MIGRATION_GUID=''
+SOURCE_REPOS=`echo "${SOURCE_REPOS}" | sed -e 's/,/ /g'`
+for REPO in ${SOURCE_REPOS}; do
+
+  SOURCE_REPO_URL="${SOURCE_BASE_URL}/${REPO}"
+
+  execute_to_source_instance "ghe-repo -p ${REPO}" 2> ${ERROR_FILE}
+  if [ `echo $?` -ne 0 ];then
+    echo "Skipped to export ${SOURCE_REPO_URL} because it doesn't exist. "
+    continue
+  fi
+  
+  output_to_file "Let's start exporting the ${REPO} repository!!"
+
+  output_to_file "START TO RUN ghe-migrator add ${SOURCE_REPO_URL} $(if [ ! -z ${MIGRATION_GUID} ];then echo "-g${MIGRATION_GUID}"; fi)"
+  ADD_LOG="${LOG_DIR}/ghe-migrator-add.log"
+  execute_to_source_instance "ghe-migrator add ${SOURCE_REPO_URL} $(if [ ! -z ${MIGRATION_GUID} ];then echo "-g${MIGRATION_GUID}"; fi)" | tee ${ADD_LOG}
+  if [ -z ${MIGRATION_GUID} ];then
+    MIGRATION_GUID=`grep 'Migration GUID:' ${ADD_LOG} | awk '{print $3}'`
+    output_to_file "MIGRATION_GUID is ${MIGRATION_GUID}"
+  fi
+
+done
+check_param 'MIGRATION_GUID' ${MIGRATION_GUID}
+
+output_to_file "Starting to run ghe-migrator export -g${MIGRATION_GUID}"
+execute_to_source_instance "ghe-migrator export -g${MIGRATION_GUID} -u${SOURCE_USER} -p${SOURCE_TOKEN}"
+
+output_to_file "Downloading /data/user/tmp/${MIGRATION_GUID}.tar.gz from the ${SOURCE_HOSTNAME} appliance."
+scp -P122 admin@${SOURCE_HOST}:/data/user/tmp/${MIGRATION_GUID}.tar.gz /tmp/ 2> ${ERROR_FILE}
+
+output_to_file "Uploading /tmp/${MIGRATION_GUID}.tar.gz to the ${TARGET_HOSTNAME} appliance."
+scp -P122 /tmp/${MIGRATION_GUID}.tar.gz admin@${TARGET_HOST}:/data/user/tmp/ 2> ${ERROR_FILE}
+
+ARCHIVE_FILE="/data/user/tmp/${MIGRATION_GUID}.tar.gz"
+
+output_to_file "Start to run ghe-migrator prepare ${ARCHIVE_FILE}"
+PREPARE_LOG="${LOG_DIR}/ghe-migrator-prepare.log"
+execute_to_target_instance "ghe-migrator prepare ${ARCHIVE_FILE}" | tee ${PREPARE_LOG} 2> ${ERROR_FILE}
+MIGRATION_GUID=`grep 'Migration GUID:' ${PREPARE_LOG} | awk '{print $3}'`
+
+check_param 'MIGRATION_GUID' ${MIGRATION_GUID}
+
+CONFLICTS_CSV='/data/user/tmp/conflicts.csv'
+COUNTER=0
+while [ ${COUNTER} -lt ${CONFLICTS_RETRY_COUNT} ];
+do
+  output_to_file "Start to run ghe-migrator conflicts -g${MIGRATION_GUID} > ${CONFLICTS_CSV}"
+  execute_to_target_instance "ghe-migrator conflicts -g${MIGRATION_GUID} > ${CONFLICTS_CSV}" | tee ${CONFLICTS_LOG}
+
+  grep 'No conflicts were found' ${CONFLICTS_LOG}
+  if [ `echo $?` -eq 0 ];then
+    output_to_file "There are no conflicts."
+    break
+  else
+    execute_to_target_instance "cat ${CONFLICTS_CSV}"
+  fi
+  output_to_file "Start to run ghe-migrator map -i ${CONFLICTS_CSV} -g${MIGRATION_GUID}"
+  execute_to_target_instance "ghe-migrator map -i ${CONFLICTS_CSV} -g${MIGRATION_GUID}"
+  COUNTER=$((COUNTER+1))
+done
+grep 'No conflicts were found' ${CONFLICTS_LOG}
+if [ `echo $?` -eq 0 ];then
+  echo "Failed to fix the conflicts. Please fix the conflicts manually." | tee -a ${ERROR_FILE} ${OUTPUT_FILE}
+  execute_to_target_instance "cat ${CONFLICTS_CSV}" | tee -a ${OUTPUT_FILE}
+  exit 1
+fi
+
+output_to_file "Start to run ghe-migrator import ${ARCHIVE_FILE} -g${MIGRATION_GUID}"
+execute_to_target_instance "ghe-migrator import ${ARCHIVE_FILE} -g${MIGRATION_GUID} -u${TARGET_USER} -p${TARGET_TOKEN}" | tee ${IMPORT_LOG}
+
+output_to_file "Start to run ghe-migrator audit -g${MIGRATION_GUID}"
+execute_to_target_instance "ghe-migrator audit -g${MIGRATION_GUID}" | tee -a ${AUDIT_LOG} ${OUTPUT_FILE}
+
+grep 'Import 100% complete' ${IMPORT_LOG}
+if [ `echo $?` -eq 0 ];then
+  output_to_file "Start to run ghe-migrator unlock -g${MIGRATION_GUID}"
+  execute_to_target_instance "ghe-migrator unlock -g${MIGRATION_GUID}"
+  output_to_file "Completed to migrate the ${REPO} repository!! Let's check ${TARGET_BASE_URL}/${REPO}"
+else 
+  output_to_file "Failed to import of ${MIGRATION_GUID} Please see ${ERROR_FILE} file."
+  exit 1
+fi
+
+exit 0
