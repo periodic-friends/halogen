@@ -1,7 +1,6 @@
 #!/bin/bash
 
 . halogen.conf
-. scripts/ghes-export
 
 SOURCE_REPOS=$1
 
